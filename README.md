@@ -27,6 +27,8 @@ MCP filesystem server
 - 支持单次 CLI、交互式终端、HTTP 服务三种使用方式
 - 支持按请求指定 `workdir`
 - 通过 `agent.config.json` 控制工作目录白名单和工具权限
+- 通过 `model.config.json` 控制 Codex、Claude、DeepSeek 等模型的调用顺序
+- 所有模型 API Key、Base URL、Model 参数都集中放在 `.env`
 - 非交互 HTTP 模式会拒绝需要人工确认的工具
 - 每个 agent step 会说明当前正在使用什么工具以及用途
 - agent step 不再返回参数摘要和工具调用结果摘要，减少冗余输出
@@ -40,11 +42,15 @@ MCP filesystem server
 ├── .env
 ├── mcp.config.json
 ├── agent.config.json
+├── model.config.json
 └── src
     ├── agent-core.js   # Agent 核心逻辑、MCP 连接、权限检查、模型循环
-    ├── index.js        # 单次 CLI 入口：npm run ask
+    ├── config.js       # 配置加载：默认值、JSON 解析、路径常量
+    ├── cli-utils.js    # CLI 公共逻辑：参数解析、帮助输出、交互循环
+    ├── http-utils.js   # HTTP 公共逻辑：JSON 响应、请求体读取、日志收集
+    ├── index.js        # 单次 CLI 入口：npm run ask / npm start
     ├── askagent.js     # 单次/多轮 CLI 入口：npm run askagent
-    ├── chat.js         # 多轮终端入口：npm run chat
+    ├── askchat.js      # 多轮终端入口：npm run askchat
     └── server.js       # HTTP 服务入口：npm run server
 ```
 
@@ -59,9 +65,17 @@ npm install
 在 `.env` 中配置：
 
 ```env
-OPENAI_API_KEY=你的第三方_API_KEY
-OPENAI_BASE_URL=你的第三方_API_地址
-OPENAI_MODEL=gpt-5.5
+CODEX_API_KEY=你的_Codex_API_KEY
+CODEX_BASE_URL=你的_Codex_OpenAI_compatible_API_地址
+CODEX_MODEL=gpt-5.5
+
+CLAUDE_API_KEY=你的_Claude_API_KEY
+CLAUDE_BASE_URL=你的_Claude_OpenAI_compatible_API_地址
+CLAUDE_MODEL=claude-sonnet-4-5
+
+DEEPSEEK_API_KEY=你的_DeepSeek_API_KEY
+DEEPSEEK_BASE_URL=你的_DeepSeek_OpenAI_compatible_API_地址
+DEEPSEEK_MODEL=deepseek-chat
 
 AGENT_SERVER_HOST=127.0.0.1
 AGENT_SERVER_PORT=8765
@@ -85,6 +99,86 @@ AGENT_SERVER_PORT=8765
 ```
 
 程序会根据每次请求的 `workdir` 动态替换 filesystem server 的授权目录。
+
+## 模型协作配置
+
+`model.config.json` 控制 Agent 使用哪个主执行模型，以及是否启用协作审查。默认推荐配置：
+
+```json
+{
+  "collaborationMode": "dynamic",
+  "activeProvider": "codex",
+  "activeStrategy": "deepseek-codex-claude-review"
+}
+```
+
+字段说明：
+
+- `activeProvider`：主执行模型，默认 `codex`。只有主执行模型负责输出可执行 JSON 工具调用。
+- `collaborationMode`：协作模式，可选 `single`、`dynamic`、`serial`。
+  - `single`：始终只调用 `activeProvider`，最快、最省成本。
+  - `dynamic`（默认）：普通步骤只调用 `activeProvider`；当准备执行 `write_file`、`edit_file`、`create_directory`、`move_file` 等高风险工具时，才按 `activeStrategy` 中除主模型外的模型请求审查意见。审查模型只提供建议，不直接调用工具。
+  - `serial`：兼容旧模式，每个 Agent Step 都按 `activeStrategy.order` 串行调用多个模型，最后一个模型输出 JSON 指令。
+- `activeStrategy`：在 `dynamic` 模式下决定审查模型范围；在 `serial` 模式下决定完整串行调用顺序。
+
+当前架构遵循「默认 Codex 单模型 + 高风险任务按需协作 + 单一工具执行者」：Codex 是唯一工具执行者，其他模型只在需要时提供规划或审查建议。
+
+完整配置示例：
+
+```json
+{
+  "collaborationMode": "dynamic",
+  "activeProvider": "codex",
+  "activeStrategy": "deepseek-codex-claude-review",
+  "providers": {
+    "codex": {
+      "apiKeyEnv": "CODEX_API_KEY",
+      "baseUrlEnv": "CODEX_BASE_URL",
+      "modelEnv": "CODEX_MODEL",
+      "defaultModel": "gpt-5.5"
+    },
+    "claude": {
+      "apiKeyEnv": "CLAUDE_API_KEY",
+      "baseUrlEnv": "CLAUDE_BASE_URL",
+      "modelEnv": "CLAUDE_MODEL",
+      "defaultModel": "claude-sonnet-4-5"
+    },
+    "deepseek": {
+      "apiKeyEnv": "DEEPSEEK_API_KEY",
+      "baseUrlEnv": "DEEPSEEK_BASE_URL",
+      "modelEnv": "DEEPSEEK_MODEL",
+      "defaultModel": "deepseek-v4-flash"
+    }
+  },
+  "strategies": {
+    "codex-only": {
+      "description": "只调用 Codex/OpenAI-compatible 模型，适合最快落地代码修改。",
+      "order": ["codex"]
+    },
+    "claude-codex": {
+      "description": "Claude 先分析规划，Codex 最后输出可执行 JSON，适合复杂需求实现。",
+      "order": ["claude", "codex"]
+    },
+    "deepseek-codex": {
+      "description": "DeepSeek 先给低成本草稿，Codex 工程化落地，适合大量中等复杂度任务。",
+      "order": ["deepseek", "codex"]
+    },
+    "deepseek-codex-claude-review": {
+      "description": "DeepSeek 初稿，Codex 实现，Claude 最终审查，适合成本敏感但需要最终质量把关。",
+      "order": ["deepseek", "codex", "claude"]
+    }
+  }
+}
+```
+
+推荐策略：
+
+- `codex-only`：最快代码落地，配合 `collaborationMode: single` 使用。
+- `claude-codex`：高质量开发，dynamic 模式下高风险操作由 Claude 审查。
+- `deepseek-codex`：高性价比开发，dynamic 模式下高风险操作由 DeepSeek 审查。
+- `deepseek-codex-claude-review`：dynamic 模式下高风险操作同时获得 DeepSeek 和 Claude 审查。
+
+切换协作模式只需修改 `collaborationMode`；切换审查模型范围只需修改 `activeStrategy`。
 
 ## Agent 配置
 
@@ -157,7 +251,7 @@ npm run askagent -- -C /home/segzix/Projects/xinyuan
 ### 多轮 Chat
 
 ```bash
-npm run chat -- -C /home/segzix/Projects/xinyuan
+npm run askchat -- -C /home/segzix/Projects/xinyuan
 ```
 
 ### HTTP 服务

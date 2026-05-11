@@ -3,94 +3,108 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { fileURLToPath } from "node:url";
-
+import { PDFParse } from "pdf-parse";
 import OpenAI from "openai";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import {
+  PROJECT_ROOT,
+  loadAgentConfig,
+  loadMcpConfig,
+  loadModelConfig,
+} from "./config.js";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const PROJECT_ROOT = path.resolve(__dirname, "..");
+export { loadAgentConfig, loadMcpConfig, loadModelConfig } from "./config.js";
 
-const MCP_CONFIG_PATH = path.join(PROJECT_ROOT, "mcp.config.json");
-const AGENT_CONFIG_PATH = path.join(PROJECT_ROOT, "agent.config.json");
+const modelClients = new Map();
 
-if (!process.env.OPENAI_API_KEY) {
-  throw new Error("Missing OPENAI_API_KEY in .env");
-}
+function getRequiredEnv(name, providerName) {
+  const value = process.env[name];
 
-if (!process.env.OPENAI_BASE_URL) {
-  throw new Error("Missing OPENAI_BASE_URL in .env");
-}
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-  baseURL: process.env.OPENAI_BASE_URL,
-  timeout: 60000,
-  maxRetries: 2,
-});
-
-const model = process.env.OPENAI_MODEL || "gpt-5.5";
-
-const defaultAgentConfig = {
-  defaultWorkdir: PROJECT_ROOT,
-  allowedWorkdirRoots: ["/home/segzix"],
-  permissions: {
-    autoAllowTools: [
-      "list_allowed_directories",
-      "list_directory",
-      "list_directory_with_sizes",
-      "directory_tree",
-      "get_file_info",
-      "search_files",
-      "read_file",
-      "read_text_file",
-      "read_media_file",
-      "read_multiple_files",
-    ],
-    askBeforeTools: [
-      "write_file",
-      "edit_file",
-      "create_directory",
-      "move_file",
-    ],
-    denyTools: [],
-  },
-  limits: {
-    maxAgentSteps: 12,
-    maxSessionHistoryMessages: 8,
-  },
-};
-
-async function loadJsonFile(filePath, fallback) {
-  try {
-    const raw = await fs.readFile(filePath, "utf-8");
-    return JSON.parse(raw);
-  } catch {
-    return fallback;
+  if (!value) {
+    throw new Error(`Missing ${name} in .env for model provider: ${providerName}`);
   }
+
+  return value;
 }
 
-export async function loadMcpConfig() {
-  return await loadJsonFile(MCP_CONFIG_PATH, null);
-}
+function getProviderRuntime(providerName, providerConfig = {}) {
+  const apiKey = getRequiredEnv(providerConfig.apiKeyEnv, providerName);
+  const baseURL = getRequiredEnv(providerConfig.baseUrlEnv, providerName);
+  const model = process.env[providerConfig.modelEnv] || providerConfig.defaultModel;
 
-export async function loadAgentConfig() {
-  const loaded = await loadJsonFile(AGENT_CONFIG_PATH, {});
+  if (!model) {
+    throw new Error(
+      `Missing ${providerConfig.modelEnv} in .env and no defaultModel configured for provider: ${providerName}`,
+    );
+  }
+
+  const cacheKey = `${providerName}:${baseURL}:${apiKey.slice(0, 8)}`;
+
+  if (!modelClients.has(cacheKey)) {
+    modelClients.set(
+      cacheKey,
+      new OpenAI({
+        apiKey,
+        baseURL,
+        timeout: 60000,
+        maxRetries: 2,
+      }),
+    );
+  }
 
   return {
-    ...defaultAgentConfig,
-    ...loaded,
-    permissions: {
-      ...defaultAgentConfig.permissions,
-      ...(loaded.permissions || {}),
-    },
-    limits: {
-      ...defaultAgentConfig.limits,
-      ...(loaded.limits || {}),
-    },
+    client: modelClients.get(cacheKey),
+    model,
   };
+}
+
+function resolveModelOrder(modelConfig) {
+  const strategyName = modelConfig.activeStrategy || "codex-only";
+  const strategy = modelConfig.strategies?.[strategyName];
+  const order = Array.isArray(strategy?.order) && strategy.order.length > 0
+    ? strategy.order
+    : ["codex"];
+
+  return {
+    strategyName,
+    strategy,
+    order,
+  };
+}
+
+function resolvePrimaryProvider(modelConfig) {
+  return modelConfig.activeProvider || "codex";
+}
+
+function resolveCollaborationMode(modelConfig) {
+  const mode = modelConfig.collaborationMode || "dynamic";
+  const supportedModes = new Set(["single", "dynamic", "serial"]);
+
+  return supportedModes.has(mode) ? mode : "dynamic";
+}
+
+function getProviderConfig(modelConfig, providerName) {
+  const providerConfig = modelConfig.providers?.[providerName];
+
+  if (!providerConfig) {
+    throw new Error(`model.config.json 中没有找到 providers.${providerName} 配置`);
+  }
+
+  return providerConfig;
+}
+
+function isHighRiskTool(toolName) {
+  return new Set([
+    "write_file",
+    "edit_file",
+    "create_directory",
+    "move_file",
+  ]).has(toolName);
+}
+
+function buildToolCallSignature(toolName, args = {}) {
+  return JSON.stringify({ toolName, args });
 }
 
 function isPathInside(child, parent) {
@@ -167,8 +181,30 @@ export async function connectFilesystemMcpServer(options = {}) {
   };
 }
 
+const virtualTools = [
+  {
+    name: "parse_pdf",
+    description: "Parse a PDF file into extracted text and metadata. Use this before asking the model to summarize, answer questions about, or extract information from a PDF. Only works for PDF files inside the current allowed workdir.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Path to the PDF file. Relative paths are resolved from the current workdir.",
+        },
+        maxChars: {
+          type: "number",
+          description: "Optional maximum number of text characters to return. Defaults to 120000.",
+        },
+      },
+      required: ["path"],
+      $schema: "http://json-schema.org/draft-07/schema#",
+    },
+  },
+];
+
 function buildToolDescriptions(mcpTools) {
-  return mcpTools
+  return [...mcpTools, ...virtualTools]
     .map((tool) => {
       return [
         `工具名: ${tool.name}`,
@@ -204,13 +240,138 @@ function extractJson(text) {
   return JSON.parse(cleaned);
 }
 
-async function callModel(conversation) {
-  const response = await openai.responses.create({
+async function callSingleModel(providerName, providerConfig, inputText) {
+  const { client, model } = getProviderRuntime(providerName, providerConfig);
+
+  const isDeepSeek =
+    String(providerName).toLowerCase().includes("deepseek") ||
+    providerConfig?.baseUrlEnv === "DEEPSEEK_BASE_URL" ||
+    providerConfig?.apiKeyEnv === "DEEPSEEK_API_KEY";
+
+  if (isDeepSeek) {
+    const response = await client.chat.completions.create({
+      model,
+      messages: [
+        {
+          role: "user",
+          content: String(inputText || ""),
+        },
+      ],
+      stream: false,
+      thinking: { type: "disabled" },
+    });
+
+    return response.choices?.[0]?.message?.content || "";
+  }
+
+  const response = await client.responses.create({
     model,
-    input: conversation,
+    input: inputText,
   });
 
   return response.output_text || "";
+}
+
+async function runSingleModelStep(conversation, modelConfig, options = {}) {
+  const { logger = console } = options;
+  const providerName = resolvePrimaryProvider(modelConfig);
+  const providerConfig = getProviderConfig(modelConfig, providerName);
+
+  logger.log(`\n模型协作模式：${resolveCollaborationMode(modelConfig)}`);
+  logger.log(`调用主执行模型：${providerName} - ${providerConfig.label || providerConfig.role || ""}`);
+
+  return callSingleModel(providerName, providerConfig, conversation);
+}
+
+async function runSerialModelStep(conversation, modelConfig, options = {}) {
+  const { logger = console } = options;
+  const { strategyName, strategy, order } = resolveModelOrder(modelConfig);
+  const outputs = [];
+
+  logger.log(`\n模型协作模式：serial`);
+  logger.log(`模型调用策略：${strategyName}${strategy?.description ? `（${strategy.description}）` : ""}`);
+  logger.log(`模型调用顺序：${order.join(" -> ")}`);
+
+  for (let index = 0; index < order.length; index += 1) {
+    const providerName = order[index];
+    const providerConfig = getProviderConfig(modelConfig, providerName);
+    const isLast = index === order.length - 1;
+    const previousOutputsText = outputs.length > 0
+      ? `\n\n前序模型输出：\n${outputs
+          .map((item) => `模型 ${item.providerName}：\n${item.output}`)
+          .join("\n\n")}`
+      : "";
+    const relayInstruction = isLast
+      ? "你是本轮最后一个模型，也是唯一工具执行者。请综合前序模型输出和原始上下文，严格输出系统要求的 JSON 指令。"
+      : "你是中间协作模型。请不要调用工具，不要输出最终 JSON；只输出给后续模型的简短分析、风险点、建议步骤和注意事项。";
+
+    logger.log(`调用协作模型：${providerName} - ${providerConfig.label || providerConfig.role || ""}`);
+
+    const output = await callSingleModel(
+      providerName,
+      providerConfig,
+      `${conversation}${previousOutputsText}\n\n多模型协作指令：\n${relayInstruction}`,
+    );
+
+    outputs.push({
+      providerName,
+      output,
+    });
+  }
+
+  return outputs.at(-1)?.output || "";
+}
+
+async function callModel(conversation, options = {}) {
+  const modelConfig = await loadModelConfig();
+  const mode = resolveCollaborationMode(modelConfig);
+
+  if (mode === "serial") {
+    return runSerialModelStep(conversation, modelConfig, options);
+  }
+
+  return runSingleModelStep(conversation, modelConfig, options);
+}
+
+async function requestCollaborationReview(conversation, command, options = {}) {
+  const { logger = console } = options;
+  const modelConfig = await loadModelConfig();
+  const mode = resolveCollaborationMode(modelConfig);
+
+  if (mode !== "dynamic") {
+    return "";
+  }
+
+  const primaryProvider = resolvePrimaryProvider(modelConfig);
+  const { order } = resolveModelOrder(modelConfig);
+  const reviewerNames = order.filter((providerName) => providerName !== primaryProvider);
+
+  if (reviewerNames.length === 0) {
+    return "";
+  }
+
+  const reviewPrompt = `${conversation}\n\n即将执行一个高风险工具调用，请你作为协作审查模型进行审查。\n\n拟执行命令：\n${JSON.stringify(command, null, 2)}\n\n审查要求：\n1. 不要输出 call_tool JSON。\n2. 不要要求直接执行工具。\n3. 只输出简短审查意见：风险点、是否建议继续、是否建议改成更安全的参数或步骤。\n4. 最终工具执行权只属于主执行模型 ${primaryProvider}。`;
+
+  const reviews = [];
+
+  logger.log("\n动态协作触发：高风险工具调用，开始请求协作审查");
+
+  for (const reviewerName of reviewerNames) {
+    const reviewerConfig = getProviderConfig(modelConfig, reviewerName);
+
+    logger.log(`调用审查模型：${reviewerName} - ${reviewerConfig.label || reviewerConfig.role || ""}`);
+
+    const output = await callSingleModel(reviewerName, reviewerConfig, reviewPrompt);
+
+    reviews.push({
+      providerName: reviewerName,
+      output,
+    });
+  }
+
+  return reviews
+    .map((item) => `模型 ${item.providerName} 审查意见：\n${item.output}`)
+    .join("\n\n");
 }
 
 async function confirmToolCallInteractive(toolName, args) {
@@ -294,33 +455,6 @@ function truncateText(text, maxLength = 500) {
   return `${value.slice(0, maxLength)}...（已省略 ${value.length - maxLength} 字符）`;
 }
 
-function summarizeForLog(value, maxLength = 800) {
-  if (typeof value === "string") {
-    return truncateText(value, maxLength);
-  }
-
-  return truncateText(JSON.stringify(value, null, 2), maxLength);
-}
-
-function summarizeToolResultForLog(result) {
-  if (Array.isArray(result)) {
-    return result
-      .map((item) => {
-        if (item?.type === "text") {
-          return {
-            ...item,
-            text: truncateText(item.text, 500),
-          };
-        }
-
-        return item;
-      })
-      .slice(0, 3);
-  }
-
-  return result;
-}
-
 function buildAgentStep(step, type, details = {}) {
   return {
     step,
@@ -337,6 +471,68 @@ function stripAgentOnlyArgs(args = {}) {
   const { purpose, _purpose, ...toolArgs } = args;
 
   return toolArgs;
+}
+
+async function parsePdfTool(args = {}, context = {}) {
+  const { workdir } = context;
+  const inputPath = args.path;
+
+  if (!inputPath || typeof inputPath !== "string") {
+    throw new Error("parse_pdf requires a string field: path");
+  }
+
+  const resolvedPath = path.isAbsolute(inputPath)
+    ? path.resolve(inputPath)
+    : path.resolve(workdir, inputPath);
+
+  if (!isPathInside(resolvedPath, workdir)) {
+    throw new Error(`PDF 路径不在当前工作目录内：${resolvedPath}`);
+  }
+
+  if (path.extname(resolvedPath).toLowerCase() !== ".pdf") {
+    throw new Error(`parse_pdf 只支持 .pdf 文件：${resolvedPath}`);
+  }
+
+  const buffer = await fs.readFile(resolvedPath);
+  const parser = new PDFParse({ data: buffer });
+  let parsed;
+
+  try {
+    parsed = await parser.getText();
+  } finally {
+    await parser.destroy();
+  }
+
+  const maxChars = Number(args.maxChars || 120000);
+  const fullText = parsed.text || "";
+  const truncated = Number.isFinite(maxChars) && maxChars > 0 && fullText.length > maxChars;
+
+  return [
+    {
+      type: "text",
+      text: JSON.stringify(
+        {
+          path: resolvedPath,
+          pages: parsed.numpages,
+          info: parsed.info || {},
+          metadata: parsed.metadata || null,
+          truncated,
+          textLength: fullText.length,
+          text: truncated ? fullText.slice(0, maxChars) : fullText,
+        },
+        null,
+        2,
+      ),
+    },
+  ];
+}
+
+async function callVirtualTool(toolName, args, context) {
+  if (toolName === "parse_pdf") {
+    return await parsePdfTool(args, context);
+  }
+
+  throw new Error(`Unknown virtual tool: ${toolName}`);
 }
 
 function describeToolPurpose(toolName, args = {}) {
@@ -361,6 +557,7 @@ function describeToolPurpose(toolName, args = {}) {
     read_multiple_files: Array.isArray(args.paths)
       ? `批量读取 ${args.paths.length} 个文件内容以便分析`
       : "批量读取多个文件内容以便分析",
+    parse_pdf: target ? `解析 PDF 文件并提取文本：${target}` : "解析 PDF 文件并提取文本",
     write_file: target ? `写入文件：${target}` : "创建或覆盖写入文件",
     edit_file: target ? `编辑文件：${target}` : "修改文本文件内容",
     create_directory: target ? `创建或确保目录存在：${target}` : "创建或确保目录存在",
@@ -424,7 +621,11 @@ export async function askAgent(options = {}) {
     const maxAgentSteps = agentConfig.limits?.maxAgentSteps || 12;
 
     const toolDescriptions = buildToolDescriptions(mcpTools);
-    const availableToolNames = new Set(mcpTools.map((tool) => tool.name));
+    const virtualToolNames = new Set(virtualTools.map((tool) => tool.name));
+    const availableToolNames = new Set([
+      ...mcpTools.map((tool) => tool.name),
+      ...virtualToolNames,
+    ]);
     const historyText = buildHistoryText(history);
 
     let conversation = `
@@ -482,10 +683,10 @@ ${userQuestion}
 `;
 
     const steps = [];
+    const reviewedToolCallSignatures = new Set();
 
     for (let step = 1; step <= maxAgentSteps; step += 1) {
-      const text = await callModel(conversation);
-
+      const text = await callModel(conversation, { logger });
       let command;
 
       try {
@@ -531,6 +732,7 @@ ${error.message}
         return {
           answer: command.answer,
           steps,
+          workdir: resolvedWorkdir,
         };
       }
 
@@ -581,6 +783,28 @@ ${Array.from(availableToolNames).join(", ")}
         continue;
       }
 
+      const toolPurpose = describeToolPurpose(toolName, args);
+      const toolCallSignature = buildToolCallSignature(toolName, toolArgs);
+      const shouldRequestReview =
+        isHighRiskTool(toolName) && !reviewedToolCallSignatures.has(toolCallSignature);
+      const reviewCommentary = shouldRequestReview
+        ? await requestCollaborationReview(conversation, command, { logger })
+        : "";
+
+      if (reviewCommentary) {
+        reviewedToolCallSignatures.add(toolCallSignature);
+        logAgentStep(logger, step, "动态协作审查完成，审查意见将注入后续上下文");
+        steps.push(buildAgentStep(step, "collaboration_review", {
+          toolName,
+          purpose: toolPurpose,
+          signature: toolCallSignature,
+        }));
+
+        conversation += `\n\n高风险工具调用协作审查意见：\n\n${reviewCommentary}\n\n主执行模型仍然是唯一工具执行者。请基于审查意见继续判断：\n1. 如果仍应执行原工具调用，请再次输出相同 call_tool JSON。\n2. 如果需要调整参数或步骤，请输出新的 call_tool JSON。\n3. 如果不应继续，请输出 final JSON 说明原因。\n`;
+
+        continue;
+      }
+
       const permission = await checkToolPermission(toolName, toolArgs, {
         interactive,
         logger,
@@ -595,7 +819,7 @@ ${Array.from(availableToolNames).join(", ")}
 ${toolName}
 
 使用这个工具的目的：
-${describeToolPurpose(toolName, args)}
+${toolPurpose}
 
 拒绝原因：
 ${permission.reason}
@@ -608,24 +832,28 @@ ${permission.reason}
 
         steps.push(buildAgentStep(step, "tool_denied", {
           toolName,
-          purpose: describeToolPurpose(toolName, args),
+          purpose: toolPurpose,
           reason: permission.reason,
         }));
 
         continue;
       }
 
-      const toolPurpose = describeToolPurpose(toolName, args);
-
       logAgentStep(logger, step, `正在使用工具 ${toolName}：${toolPurpose}`);
 
       let toolResult;
 
       try {
-        toolResult = await mcp.callTool({
-          name: toolName,
-          arguments: toolArgs,
-        });
+        if (virtualToolNames.has(toolName)) {
+          toolResult = await callVirtualTool(toolName, toolArgs, {
+            workdir: resolvedWorkdir,
+          });
+        } else {
+          toolResult = await mcp.callTool({
+            name: toolName,
+            arguments: toolArgs,
+          });
+        }
       } catch (error) {
         toolResult = {
           error: error.message || String(error),
@@ -665,6 +893,7 @@ ${JSON.stringify(normalizedToolResult, null, 2)}
     return {
       answer: fallbackAnswer,
       steps,
+      workdir: resolvedWorkdir,
     };
   } finally {
     try {

@@ -1,32 +1,10 @@
 import "dotenv/config";
 import http from "node:http";
 import { askAgent, resolveWorkdir } from "./agent-core.js";
+import { sendJson, readJsonBody, createMemoryLogger } from "./http-utils.js";
+
 const HOST = process.env.AGENT_SERVER_HOST || "127.0.0.1";
 const PORT = Number(process.env.AGENT_SERVER_PORT || 8765);
-
-function sendJson(res, statusCode, data) {
-  const body = JSON.stringify(data, null, 2);
-  res.writeHead(statusCode, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Content-Length": Buffer.byteLength(body)
-  });
-  res.end(body);
-}
-
-function readRequestBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    req.on("data", (chunk) => {
-      body += chunk;
-      if (body.length > 1024 * 1024) {
-        reject(new Error("Request body too large"));
-        req.destroy();
-      }
-    });
-    req.on("end", () => resolve(body));
-    req.on("error", reject);
-  });
-}
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -39,12 +17,15 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === "POST" && req.url === "/ask") {
-      const rawBody = await readRequestBody(req);
       let body;
+
       try {
-        body = JSON.parse(rawBody || "{}");
-      } catch {
-        sendJson(res, 400, { ok: false, error: "Invalid JSON body" });
+        body = await readJsonBody(req);
+      } catch (error) {
+        sendJson(res, error.statusCode || 400, {
+          ok: false,
+          error: error.message || "Invalid request body",
+        });
         return;
       }
       const question = body.question;
@@ -55,16 +36,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const resolvedWorkdir = await resolveWorkdir(requestedWorkdir);
-      const logs = [];
-      const logger = {
-        log: (...args) => {
-          const line = args
-            .map((item) => typeof item === "string" ? item :JSON.stringify(item))
-            .join(" ");
-          logs.push(line);
-          console.log(...args);
-        }
-      };
+      const { logs, logger } = createMemoryLogger(console);
       const result = await askAgent({
         question,
         workdir: resolvedWorkdir,

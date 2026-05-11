@@ -18,6 +18,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "latest",
     "dotenv": "latest",
-    "openai": "latest"
+    "openai": "latest",
+    "pdf-parse": "^2.4.5"
   }
 }

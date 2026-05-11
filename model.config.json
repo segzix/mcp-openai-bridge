@@ -1,0 +1,79 @@
+{
+  "collaborationMode": "dynamic",
+  "activeProvider": "deepseek",
+  "activeStrategy": "claude-codex",
+  "providers": {
+    "codex": {
+      "label": "Codex / OpenAI-compatible code model",
+      "apiKeyEnv": "CODEX_API_KEY",
+      "baseUrlEnv": "CODEX_BASE_URL",
+      "modelEnv": "CODEX_MODEL",
+      "defaultModel": "gpt-5.5",
+      "role": "工程实现、代码修改、测试修复、工具调用落地"
+    },
+    "claude": {
+      "label": "Claude-compatible model",
+      "apiKeyEnv": "CLAUDE_API_KEY",
+      "baseUrlEnv": "CLAUDE_BASE_URL",
+      "modelEnv": "CLAUDE_MODEL",
+      "defaultModel": "claude-sonnet-4-5",
+      "role": "需求分析、架构规划、长文本理解、风险审查"
+    },
+    "deepseek": {
+      "label": "DeepSeek-compatible model",
+      "apiKeyEnv": "DEEPSEEK_API_KEY",
+      "baseUrlEnv": "DEEPSEEK_BASE_URL",
+      "modelEnv": "DEEPSEEK_MODEL",
+      "defaultModel": "deepseek-chat",
+      "role": "中文技术解释、算法推理、低成本草稿、批量辅助"
+    }
+  },
+  "strategies": {
+    "codex-only": {
+      "description": "只调用 Codex/OpenAI-compatible 模型，适合最快落地代码修改。",
+      "order": ["codex"]
+    },
+    "claude-codex": {
+      "description": "Claude 先分析规划，Codex 最后输出可执行 JSON，适合复杂需求实现。",
+      "order": ["claude", "codex"]
+    },
+    "deepseek-codex": {
+      "description": "DeepSeek 先给低成本草稿，Codex 工程化落地，适合大量中等复杂度任务。",
+      "order": ["deepseek", "codex"]
+    },
+    "claude-codex-deepseek-review": {
+      "description": "Claude 规划，Codex 落地，DeepSeek 从中文和边界样例角度补充，适合均衡质量与成本。",
+      "order": ["claude", "codex", "deepseek"]
+    },
+    "deepseek-codex-claude-review": {
+      "description": "DeepSeek 初稿，Codex 实现，Claude 最终审查，适合成本敏感但需要最终质量把关。",
+      "order": ["deepseek", "codex", "claude"]
+    },
+    "custom": {
+      "description": "自定义顺序；直接修改 order 即可。最后一个模型的输出会作为本轮 Agent 指令。",
+      "order": ["claude", "codex"]
+    }
+  },
+  "recommendedStrategies": [
+    {
+      "name": "高质量开发",
+      "strategy": "claude-codex",
+      "reason": "Claude 负责需求、边界和风险，Codex 负责最终工具调用与代码落地。"
+    },
+    {
+      "name": "高性价比开发",
+      "strategy": "deepseek-codex",
+      "reason": "DeepSeek 先生成草稿和思路，Codex 只做关键工程化输出。"
+    },
+    {
+      "name": "最终审查优先",
+      "strategy": "deepseek-codex-claude-review",
+      "reason": "适合较复杂变更；Claude 在最后检查安全性、可维护性和需求遗漏。"
+    },
+    {
+      "name": "最快代码落地",
+      "strategy": "codex-only",
+      "reason": "减少多模型传递成本，适合明确的小型代码任务。"
+    }
+  ]
+}
