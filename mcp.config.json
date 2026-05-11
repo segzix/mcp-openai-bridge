@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "/home/segzix/.nvm/versions/node/v24.11.1/bin/npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/home/segzix/Projects"
+      ]
+    }
+  }
+}

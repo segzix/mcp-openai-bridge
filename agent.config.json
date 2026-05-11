@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "autoAllowTools": [
+      "list_allowed_directories",
+      "list_directory",
+      "list_directory_with_sizes",
+      "directory_tree",
+      "get_file_info",
+      "search_files",
+      "read_file",
+      "read_text_file",
+      "read_media_file",
+      "read_multiple_files",
+      "write_file",
+      "edit_file",
+      "create_directory"
+    ],
+    "askBeforeTools": [
+      "move_file"
+    ],
+    "denyTools": []
+  },
+  "limits": {
+    "maxAgentSteps": 24,
+    "maxSessionHistoryMessages": 8
+  },
+  "defaultWorkdir": "/home/segzix/Projects/mcp-openai-bridge",
+  "allowedWorkdirRoots": [
+    "/home/segzix/Projects",
+    "/home/segzix/ai-workspace"
+  ]
+}

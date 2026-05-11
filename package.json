@@ -1,0 +1,23 @@
+{
+  "name": "mcp-openai-bridge",
+  "version": "1.0.0",
+  "description": "Local MCP filesystem bridge for OpenAI-compatible ResponsesAPI",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "askagent": "src/askagent.js",
+    "askchat": "src/askchat.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "ask": "node src/index.js",
+    "server": "node src/server.js",
+    "askagent": "node src/askagent.js",
+    "askchat": "node src/askchat.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "latest",
+    "dotenv": "latest",
+    "openai": "latest"
+  }
+}
